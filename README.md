@@ -93,6 +93,29 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * ActiveRecord (optionally: ActiveRecord::Missing and ActiveRecord::StoreProcs)
 * KeyValue (uses active_support/json and cannot store procs)
 
+## Masking translations
+
+When translations are layered (e.g. tenant translations overriding common ones
+via `I18n::Backend::Chain`, or locale fallbacks), deleting a key from the
+overlay is not enough to take an outdated translation offline: the lookup
+would fall through to the lower backend or fallback locale again. Storing the
+`I18n::Backend::MASKED` sentinel for a key (or a whole namespace) marks the
+lookup as definitively missing instead:
+
+```ruby
+I18n.backend.store_translations(:en, :obsolete => I18n::Backend::MASKED)
+I18n.backend.store_translations(:en, :legacy_namespace => I18n::Backend::MASKED)
+```
+
+A masked lookup behaves like a missing translation in both `translate` and
+`exists?`, but neither `Chain` nor `Fallbacks` will continue searching in
+lower backends or other fallback locales. A non-symbol `:default` passed by
+the caller is still honored. The values `nil`, `false` and `""` keep their
+original semantics and cannot be used as a mask. Masked leaves are removed
+from namespace translations, so the marker never shows up in return values.
+To unmask a key, simply store a new value (or `nil`) over the mask, which
+restores translations from lower backends and fallback locales.
+
 For more information and lots of resources see [the 'Resources' page on the wiki](https://github.com/ruby-i18n/i18n/wiki/Resources).
 
 ## Tests

@@ -38,6 +38,30 @@ module I18n
         end
       end
 
+      # Returns true if the given value is the I18n::Backend::MASKED sentinel.
+      def masked?(value)
+        value.equal?(I18n::Backend::MASKED)
+      end
+
+      # Returns a copy of the given hash with all masked leaves
+      # (I18n::Backend::MASKED) removed, recursively. Returns the given
+      # object unchanged when it contains no masked leaves, so the marker
+      # never shows up in a returned namespace translation.
+      def deep_unmask(value)
+        return value unless value.is_a?(Hash)
+
+        copy = nil
+        value.each_pair do |key, nested|
+          if masked?(nested)
+            (copy ||= value.dup).delete(key)
+          elsif nested.is_a?(Hash)
+            unmasked = deep_unmask(nested)
+            (copy ||= value.dup)[key] = unmasked unless unmasked.equal?(nested)
+          end
+        end
+        copy || value
+      end
+
       private
 
       def deep_symbolize_keys_in_object(value)

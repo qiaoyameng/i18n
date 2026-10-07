@@ -58,7 +58,7 @@ module I18n
           options = Utils.except(default_options, :default)
 
           backends.each do |backend|
-            catch(:exception) do
+            thrown = catch(:exception) do
               options = default_options if backend == backends.last
               translation = backend.translate(locale, key, options)
               if namespace_lookup?(translation, options)
@@ -66,6 +66,18 @@ module I18n
               elsif !translation.nil? || (options.key?(:default) && options[:default].nil?)
                 return translation
               end
+              nil
+            end
+
+            # A masked translation is definitively missing: do not continue
+            # looking in lower backends, but still honor a caller given
+            # :default the same way a regular miss on the last backend would.
+            if thrown.is_a?(I18n::MaskedTranslation)
+              if default_options.key?(:default)
+                default = default(locale, key, default_options[:default], default_options)
+                return default unless default.nil? && !default_options[:default].nil?
+              end
+              throw(:exception, thrown)
             end
           end
 
@@ -74,8 +86,16 @@ module I18n
         end
 
         def exists?(locale, key, options = EMPTY_HASH)
+          backends.each do |backend|
+            return false if backend.respond_to?(:masked?) && backend.masked?(locale, key, options)
+            return true if backend.exists?(locale, key, options)
+          end
+          false
+        end
+
+        def masked?(locale, key, options = EMPTY_HASH)
           backends.any? do |backend|
-            backend.exists?(locale, key, options)
+            backend.respond_to?(:masked?) && backend.masked?(locale, key, options)
           end
         end
 

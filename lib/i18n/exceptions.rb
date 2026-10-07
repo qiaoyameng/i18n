@@ -87,6 +87,17 @@ module I18n
     include MissingTranslation::Base
   end
 
+  # Thrown (via throw :exception) when a lookup hits an explicitly masked
+  # translation (see I18n::Backend::MASKED). Behaves like a missing
+  # translation towards the caller, but signals to Chain and Fallbacks that
+  # the miss is final and they must not continue searching in lower backends
+  # or other fallback locales.
+  class MaskedTranslation < MissingTranslation
+    def message
+      "#{super} (masked)"
+    end
+  end
+
   class InvalidPluralizationData < ArgumentError
     attr_reader :entry, :count, :key
     def initialize(entry, count, key)

@@ -52,14 +52,27 @@ module I18n
         default = extract_non_symbol_default!(options) if options[:default]
 
         fallback_options = options.merge(:fallback_in_progress => true, fallback_original_locale: locale)
+        masked = nil
         I18n.fallbacks[locale].each do |fallback|
           begin
-            catch(:exception) do
-              result = super(fallback, key, fallback_options)
-              unless result.nil?
+            thrown = catch(:exception) do
+              translation = super(fallback, key, fallback_options)
+              unless translation.nil?
                 on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
-                return result
+                return translation
               end
+              nil
+            end
+            # A masked translation is definitively missing: do not continue
+            # looking in other fallback locales. super may also have returned
+            # nil without throwing (e.g. for :default => nil) when hitting a
+            # mask, so double check the locale in that case.
+            if thrown.is_a?(I18n::MaskedTranslation)
+              masked = thrown
+              break
+            elsif thrown.nil? && masked?(fallback, key, options.merge(:fallback => false))
+              masked = I18n::MaskedTranslation.new(locale, key, options)
+              break
             end
           rescue I18n::InvalidLocale
             # we do nothing when the locale is invalid, as this is a fallback anyways.
@@ -69,7 +82,7 @@ module I18n
         return if options.key?(:default) && options[:default].nil?
 
         return super(locale, nil, options.merge(:default => default)) if default
-        throw(:exception, I18n::MissingTranslation.new(locale, key, options))
+        throw(:exception, masked || I18n::MissingTranslation.new(locale, key, options))
       end
 
       def resolve_entry(locale, object, subject, options = EMPTY_HASH)
@@ -105,9 +118,29 @@ module I18n
 
       def exists?(locale, key, options = EMPTY_HASH)
         return super unless options.fetch(:fallback, true)
+        return false if masked?(locale, key, options)
+
         I18n.fallbacks[locale].each do |fallback|
           begin
-            return true if super(fallback, key, options)
+            return true if super(fallback, key, options.merge(:fallback_original_locale => locale))
+          rescue I18n::InvalidLocale
+            # we do nothing when the locale is invalid, as this is a fallback anyways.
+          end
+        end
+
+        false
+      end
+
+      # Returns true if the lookup for the given key hits an explicitly
+      # masked translation (see I18n::Backend::MASKED) in the requested
+      # locale or any fallback locale that would be reached before finding
+      # an actual translation.
+      def masked?(locale, key, options = EMPTY_HASH)
+        return super unless options.fetch(:fallback, true)
+        I18n.fallbacks[locale].each do |fallback|
+          begin
+            return true if super(fallback, key, options.merge(:fallback_original_locale => locale))
+            return false if exists?(fallback, key, options.merge(:fallback => false))
           rescue I18n::InvalidLocale
             # we do nothing when the locale is invalid, as this is a fallback anyways.
           end

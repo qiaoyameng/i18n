@@ -427,7 +427,9 @@ module I18n
       if result.is_a?(MissingTranslation)
         handle_exception((throw && :throw || raise && :raise), result, locale, key, options)
       else
-        result
+        # Make sure the I18n::Backend::MASKED marker never leaks into a
+        # returned namespace translation.
+        result.is_a?(Hash) ? Utils.deep_unmask(result) : result
       end
     end
 

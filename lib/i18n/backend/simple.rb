@@ -89,7 +89,8 @@ module I18n
         # either key is nil, or locale, scope or key do not exist as a key in the
         # nested translations hash. Splits keys or scopes containing dots
         # into multiple keys, i.e. <tt>currency.format</tt> is regarded the same as
-        # <tt>%w(currency format)</tt>.
+        # <tt>%w(currency format)</tt>. Returns the I18n::Backend::MASKED sentinel
+        # when the lookup hits an explicitly masked key or namespace.
         def lookup(locale, key, scope = [], options = EMPTY_HASH)
           init_translations unless initialized?
           keys = I18n.normalize_keys(locale, key, scope, options[:separator])
@@ -101,6 +102,7 @@ module I18n
               return nil unless result.has_key?(_key)
             end
             result = result[_key]
+            return result if Utils.masked?(result)
             result = resolve_entry(locale, _key, result, Utils.except(options.merge(:scope => nil), :count)) if result.is_a?(Symbol)
             result
           end

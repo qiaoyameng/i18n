@@ -2,6 +2,7 @@
 
 require 'yaml'
 require 'json'
+require 'i18n/backend/masked'
 
 module I18n
   module Backend
@@ -31,6 +32,8 @@ module I18n
         return nil if key.nil? && !options.key?(:default)
 
         entry = lookup(locale, key, options[:scope], options) unless key.nil?
+        masked = Utils.masked?(entry)
+        entry = nil if masked
 
         if entry.nil? && options.key?(:default)
           entry = default(locale, key, options[:default], options)
@@ -42,15 +45,24 @@ module I18n
 
         if entry.nil? && (subtrees? || !count)
           if (options.key?(:default) && !options[:default].nil?) || !options.key?(:default)
-            throw(:exception, I18n::MissingTranslation.new(locale, key, options))
+            throw(:exception, missing_translation(masked, locale, key, options))
           end
         end
 
         entry = entry.dup if entry.is_a?(String)
         entry = pluralize(locale, entry, count) if count
 
-        if entry.nil? && !subtrees?
-          throw(:exception, I18n::MissingTranslation.new(locale, key, options))
+        if Utils.masked?(entry)
+          # A masked pluralization form is definitively missing, too.
+          masked = true
+          entry = nil
+          entry = default(locale, key, options[:default], options) if options.key?(:default)
+        end
+
+        if entry.nil? && (!subtrees? || masked)
+          unless masked && options.key?(:default) && options[:default].nil?
+            throw(:exception, missing_translation(masked, locale, key, options))
+          end
         end
 
         deep_interpolation = options[:deep_interpolation]
@@ -69,7 +81,15 @@ module I18n
       end
 
       def exists?(locale, key, options = EMPTY_HASH)
-        lookup(locale, key, options[:scope]) != nil
+        entry = lookup(locale, key, options[:scope], options)
+        !entry.nil? && !Utils.masked?(entry)
+      end
+
+      # Returns true if the translation for the given key is explicitly
+      # masked with I18n::Backend::MASKED, i.e. the lookup is meant to be
+      # treated as definitively missing.
+      def masked?(locale, key, options = EMPTY_HASH)
+        Utils.masked?(lookup(locale, key, options[:scope], options))
       end
 
       # Acts the same as +strftime+, but uses a localized version of the
@@ -119,6 +139,14 @@ module I18n
 
         def subtrees?
           true
+        end
+
+        # Builds the exception thrown for a missing translation. Masked
+        # lookups raise a MaskedTranslation so that Chain and Fallbacks
+        # know the miss is final.
+        def missing_translation(masked, locale, key, options)
+          klass = masked ? I18n::MaskedTranslation : I18n::MissingTranslation
+          klass.new(locale, key, options)
         end
 
         # Evaluates defaults.

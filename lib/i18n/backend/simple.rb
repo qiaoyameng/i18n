@@ -101,7 +101,14 @@ module I18n
               return nil unless result.has_key?(_key)
             end
             result = result[_key]
-            result = resolve_entry(locale, _key, result, Utils.except(options.merge(:scope => nil), :count)) if result.is_a?(Symbol)
+            return I18n::BLOCKED if result.equal?(I18n::BLOCKED)
+            if result.is_a?(Symbol)
+              resolved = catch(:exception) do
+                resolve_entry(locale, _key, result, Utils.except(options.merge(:scope => nil), :count))
+              end
+              return I18n::BLOCKED if resolved.is_a?(BlockedTranslation)
+              result = resolved
+            end
             result
           end
         end

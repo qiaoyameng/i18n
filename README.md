@@ -79,6 +79,52 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * Custom exception handlers
 * Extensible architecture with a swappable backend
 
+## Blocking translations
+
+Sometimes a tenant translation needs to permanently retire a copy that the
+base application (or a fallback locale) still ships. Deleting the overriding
+key is not enough with `I18n::Backend::Chain`, because the chain then falls
+through to the lower backend and surfaces the old copy again.
+
+Store the `I18n::BLOCKED` sentinel on the leaf key (or on an entire
+namespace) to mark the lookup as terminally missing. The block affects both
+`translate` and `exists?`, stops the `Chain` from consulting lower backends
+and stops `I18n::Backend::Fallbacks` from trying other locales. The marker
+never appears in returned values: blocked hash keys are simply omitted.
+
+```ruby
+I18n.backend.store_translations(:en, retired_button: I18n::BLOCKED,
+                                old_section: { hint: I18n::BLOCKED })
+
+I18n.t(:retired_button)        # => "Translation blocked: en.retired_button"
+I18n.exists?(:retired_button)  # => false
+I18n.t(:old_section)           # => {} (the blocked leaf is omitted)
+```
+
+`nil`, `false` and the empty String keep their original meaning and must not
+be used as markers. An explicit, non-Symbol `:default` passed by the caller
+is still honored, as usual; a Symbol default that itself resolves to a
+blocked key stays blocked.
+
+```ruby
+I18n.t(:retired_button, default: "Not available") # => "Not available"
+I18n.t(:retired_button, default: nil)             # => nil
+I18n.t(:other, default: :retired_button)          # => "Translation blocked: ..."
+```
+
+Removing the entry (e.g. reloading translations without the marker)
+unblocks the key again, so lower backend / fallback translations become
+visible:
+
+```ruby
+I18n.backend = I18n::Backend::Chain.new(tenant_backend, app_backend)
+tenant_backend.store_translations(:en, :shared => I18n::BLOCKED)
+I18n.t(:shared) # => "Translation blocked: en.shared"
+
+tenant_backend.send(:translations)[:en].delete(:shared)
+I18n.t(:shared) # => the copy from app_backend is back
+```
+
 ## Pluggable Features
 
 * Cache

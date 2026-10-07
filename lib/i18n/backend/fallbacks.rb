@@ -54,12 +54,19 @@ module I18n
         fallback_options = options.merge(:fallback_in_progress => true, fallback_original_locale: locale)
         I18n.fallbacks[locale].each do |fallback|
           begin
-            catch(:exception) do
+            caught = catch(:exception) do
               result = super(fallback, key, fallback_options)
               unless result.nil?
                 on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
                 return result
               end
+            end
+            if caught.is_a?(BlockedTranslation)
+              # A block is a terminal miss: do not keep walking fallback locales.
+              # An explicit non-Symbol default (already extracted) still applies.
+              return super(locale, nil, options.merge(:default => default)) if default
+              return if options.key?(:default) && options[:default].nil?
+              throw(:exception, BlockedTranslation.new(locale, key, options))
             end
           rescue I18n::InvalidLocale
             # we do nothing when the locale is invalid, as this is a fallback anyways.
@@ -91,7 +98,11 @@ module I18n
             subject
           end
         end
-        result unless result.is_a?(MissingTranslation)
+        if result.is_a?(BlockedTranslation)
+          throw(:exception, result)
+        else
+          result unless result.is_a?(MissingTranslation)
+        end
       end
 
       def extract_non_symbol_default!(options)
@@ -107,12 +118,28 @@ module I18n
         return super unless options.fetch(:fallback, true)
         I18n.fallbacks[locale].each do |fallback|
           begin
+            single = Utils.except(options, :fallback).merge(:fallback => false)
+            return false if blocked?(fallback, key, single)
             return true if super(fallback, key, options)
           rescue I18n::InvalidLocale
             # we do nothing when the locale is invalid, as this is a fallback anyways.
           end
         end
 
+        false
+      end
+
+      def blocked?(locale, key, options = EMPTY_HASH)
+        return super unless options.fetch(:fallback, true)
+        I18n.fallbacks[locale].each do |fallback|
+          begin
+            single = Utils.except(options, :fallback).merge(:fallback => false)
+            return true if super(fallback, key, single)
+            return false if exists?(fallback, key, single)
+          rescue I18n::InvalidLocale
+            # we do nothing when the locale is invalid, as this is a fallback anyways.
+          end
+        end
         false
       end
 

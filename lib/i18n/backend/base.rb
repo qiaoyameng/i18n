@@ -40,6 +40,20 @@ module I18n
 
         count = options[:count]
 
+        # An explicitly blocked key is terminally missing for this backend.
+        if blocked_entry?(entry)
+          # Only an explicit default (nil included) can rescue the lookup;
+          # lower backends / fallback locales must not be consulted.
+          throw(:exception, BlockedTranslation.new(locale, key, options)) unless options.key?(:default)
+          if options[:default].nil?
+            return nil
+          else
+            resolved = resolve_blocked_default(locale, key, options[:default], options)
+            entry = resolved unless resolved.nil?
+          end
+          throw(:exception, BlockedTranslation.new(locale, key, options)) if entry.nil? || blocked_entry?(entry)
+        end
+
         if entry.nil? && (subtrees? || !count)
           if (options.key?(:default) && !options[:default].nil?) || !options.key?(:default)
             throw(:exception, I18n::MissingTranslation.new(locale, key, options))
@@ -47,7 +61,12 @@ module I18n
         end
 
         entry = entry.dup if entry.is_a?(String)
+        throw(:exception, BlockedTranslation.new(locale, key, options)) if blocked_entry?(entry)
+        if count && entry.is_a?(Hash) && blocked_pluralization_key?(entry, count)
+          throw(:exception, BlockedTranslation.new(locale, key, options))
+        end
         entry = pluralize(locale, entry, count) if count
+        throw(:exception, BlockedTranslation.new(locale, key, options)) if blocked_entry?(entry)
 
         if entry.nil? && !subtrees?
           throw(:exception, I18n::MissingTranslation.new(locale, key, options))
@@ -65,11 +84,38 @@ module I18n
         elsif entry.is_a?(String) && entry =~ I18n.reserved_keys_pattern
           raise ReservedInterpolationKey.new($1.to_sym, entry)
         end
+        entry = prune_blocked_entries(entry)
         entry
       end
 
       def exists?(locale, key, options = EMPTY_HASH)
-        lookup(locale, key, options[:scope]) != nil
+        entry = lookup(locale, key, options[:scope], options)
+        entry != nil && !blocked_entry?(entry)
+      rescue NotImplementedError
+        # Backends that do not implement #lookup (and therefore can't store
+        # I18n::BLOCKED either) answer through #translate instead.
+        !catch(:exception) { translate(locale, key, Utils.except(options, :default)) }.nil?
+      end
+
+      # Returns true when the translation for the given key has been explicitly
+      # blocked with I18n::BLOCKED, either on the key itself or somewhere in
+      # its namespace. A blocked key counts as missing, both for +translate+
+      # and +exists?+.
+      def blocked?(locale, key, options = EMPTY_HASH)
+        entry = lookup(locale, key, options[:scope], options)
+        blocked_entry?(entry) || (entry.is_a?(Hash) && entry_contains_block?(entry))
+      rescue NotImplementedError
+        false
+      end
+
+      # Internal: raw lookup result used by I18n::Backend::Chain while merging
+      # namespace subtrees. Unlike #translate it leaves I18n::BLOCKED markers
+      # in place so a block in an earlier backend can mask values merged in
+      # from lower backends.
+      def blocked_lookup(locale, key, options = EMPTY_HASH)
+        lookup(locale, key, options[:scope], options)
+      rescue NotImplementedError
+        nil
       end
 
       # Acts the same as +strftime+, but uses a localized version of the
@@ -112,6 +158,57 @@ module I18n
           @eager_loaded ||= false
         end
 
+        # True when the looked up entry is an explicit block (I18n::BLOCKED).
+        # A subtree that merely contains blocked leaves is not blocked as a
+        # whole; the leaves are pruned from the returned subtree instead.
+        def blocked_entry?(entry)
+          entry.equal?(I18n::BLOCKED)
+        end
+
+        def blocked_pluralization_key?(entry, count)
+          key = count == 0 && entry.has_key?(:zero) ? :zero : (count == 1 ? :one : :other)
+          entry[key].equal?(I18n::BLOCKED)
+        end
+
+        # Resolves an explicit default against a blocked key. Non-Symbol
+        # subjects (including false, Strings, Procs and Hashes) are returned
+        # directly; Symbols are looked up like ordinary default keys and may
+        # themselves resolve to a blocked key (which stays blocked).
+        def resolve_blocked_default(locale, object, subject, options)
+          default_options = Utils.except(options, :default)
+          subjects = subject.is_a?(Array) ? subject : [subject]
+          subjects.each do |item|
+            resolved = catch(:exception) { resolve(locale, object, item, default_options) }
+            next if resolved.nil? || resolved.is_a?(BlockedTranslation)
+            return resolved unless resolved.is_a?(MissingTranslation)
+          end
+          nil
+        end
+
+        def entry_contains_block?(entry)
+          entry.any? do |_key, value|
+            value.equal?(I18n::BLOCKED) || (value.is_a?(Hash) && entry_contains_block?(value))
+          end
+        end
+
+        # Removes I18n::BLOCKED markers from a returned subtree so the marker
+        # can never leak into a translation result. Hash keys carrying the
+        # marker disappear; other structures (e.g. Arrays) have the markers
+        # replaced with nil.
+        def prune_blocked_entries(entry)
+          case entry
+          when Hash
+            entry.each_with_object({}) do |(key, value), result|
+              next if value.equal?(I18n::BLOCKED)
+              result[key] = prune_blocked_entries(value)
+            end
+          when Array
+            entry.map { |value| value.equal?(I18n::BLOCKED) ? nil : prune_blocked_entries(value) }
+          else
+            entry
+          end
+        end
+
         # The method which actually looks up for the translation in the store.
         def lookup(locale, key, scope = [], options = EMPTY_HASH)
           raise NotImplementedError
@@ -135,7 +232,8 @@ module I18n
           case subject
           when Array
             subject.each do |item|
-              result = resolve(locale, object, item, options)
+              result = catch(:exception) { resolve(locale, object, item, options) }
+              result = nil if result.is_a?(MissingTranslation)
               return result unless result.nil?
             end and nil
           else
@@ -167,7 +265,11 @@ module I18n
               subject
             end
           end
-          result unless result.is_a?(MissingTranslation)
+          if result.is_a?(BlockedTranslation)
+            throw(:exception, result)
+          else
+            result unless result.is_a?(MissingTranslation)
+          end
         end
         alias_method :resolve_entry, :resolve
 

@@ -35,6 +35,27 @@ module I18n
   ]
   EMPTY_HASH = {}.freeze
 
+  # Sentinel value used to explicitly mark a translation as blocked.
+  #
+  # Storing this value for a key (or for an entire namespace) makes that
+  # lookup terminally missing: I18n will neither fall through to lower
+  # backends (when using I18n::Backend::Chain) nor to other locales (when
+  # using I18n::Backend::Fallbacks). Unlike +nil+, +false+ and the empty
+  # String (which keep their usual translation semantics) this object has no
+  # meaning as a translation and never appears in returned values.
+  #
+  #   I18n.backend.store_translations(:en, :legacy => I18n::BLOCKED)
+  #   I18n.t(:legacy) # => "Translation missing: en.legacy"
+  #
+  # Remove the entry (e.g. by reloading translations without it) to unblock
+  # the key and restore lower backend / fallback translations again.
+  BLOCKED = Object.new.tap do |blocked|
+    def blocked.inspect
+      'I18n::BLOCKED'
+    end
+    alias_method :to_s, :inspect
+  end.freeze
+
   def self.new_double_nested_cache # :nodoc:
     Concurrent::Map.new { |h, k| h[k] = Concurrent::Map.new }
   end

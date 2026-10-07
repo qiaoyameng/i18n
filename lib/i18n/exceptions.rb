@@ -87,6 +87,28 @@ module I18n
     include MissingTranslation::Base
   end
 
+  # Raised (thrown) when a translation has been explicitly blocked with
+  # I18n::BLOCKED. It behaves like a MissingTranslation for callers, but is a
+  # distinct signal so chained backends and locale fallbacks know the lookup
+  # is terminally missing and must not be resolved anywhere else.
+  class BlockedTranslation < MissingTranslation
+    def message
+      "Translation blocked: #{keys.join('.')}"
+    end
+
+    def to_exception
+      BlockedTranslationData.new(locale, key, options)
+    end
+  end
+
+  class BlockedTranslationData < ArgumentError
+    include MissingTranslation::Base
+
+    def message
+      "Translation blocked: #{keys.join('.')}"
+    end
+  end
+
   class InvalidPluralizationData < ArgumentError
     attr_reader :entry, :count, :key
     def initialize(entry, count, key)

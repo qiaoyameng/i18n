@@ -16,7 +16,7 @@ module I18n
     #
     # The implementation assumes that all backends added to the Chain implement
     # a lookup method with the same API as Simple backend does.
-    # 
+    #
     # Fallback translations using the :default option are only used by the last backend of a chain.
     class Chain
       module Implementation
@@ -55,28 +55,82 @@ module I18n
 
         def translate(locale, key, default_options = EMPTY_HASH)
           namespace = nil
+          blocked = false
           options = Utils.except(default_options, :default)
 
           backends.each do |backend|
-            catch(:exception) do
-              options = default_options if backend == backends.last
+            thrown = catch(:exception) do
+              is_last = backend == backends.last
+              options = default_options if is_last
               translation = backend.translate(locale, key, options)
               if namespace_lookup?(translation, options)
-                namespace = _deep_merge(translation, namespace || {})
+                if is_last
+                  namespace = _deep_merge(translation, namespace || {})
+                else
+                  # Translate prunes I18n::BLOCKED markers from the result, so
+                  # merge the raw subtree (with markers) when the result is a
+                  # plain namespace; other Hashes (e.g. Hash defaults that
+                  # went through deep interpolation) are returned as-is.
+                  subtree = raw_namespace(backend, locale, key, options)
+                  if subtree.equal?(I18n::BLOCKED)
+                    blocked = true
+                    throw(:exception)
+                  elsif subtree.is_a?(Hash)
+                    namespace = _deep_merge(subtree, namespace || {})
+                  else
+                    return translation
+                  end
+                end
               elsif !translation.nil? || (options.key?(:default) && options[:default].nil?)
                 return translation
               end
             end
+            if thrown.is_a?(BlockedTranslation)
+              blocked = true
+              break
+            end
           end
 
-          return namespace if namespace
+          return prune_blocked_entries(namespace) if namespace
+
+          return if blocked && default_options.key?(:default) && default_options[:default].nil?
+
+          if blocked
+            default_subject = default_options[:default]
+            if default_options.key?(:default)
+              return nil if default_subject.nil?
+              resolved = resolve_blocked_default(locale, key, default_subject, default_options)
+              unless resolved.nil?
+                values = Utils.except(default_options, *RESERVED_KEYS)
+                resolved = interpolate(locale, resolved, values) unless values.empty?
+                return resolved
+              end
+            end
+            throw(:exception, BlockedTranslation.new(locale, key, default_options))
+          end
+
           throw(:exception, I18n::MissingTranslation.new(locale, key, options))
         end
 
         def exists?(locale, key, options = EMPTY_HASH)
-          backends.any? do |backend|
-            backend.exists?(locale, key, options)
+          backends.each do |backend|
+            return false if backend.blocked?(locale, key, options)
+            return true if backend.exists?(locale, key, options)
           end
+          false
+        end
+
+        # True when the key is blocked by a backend earlier in the chain than
+        # any backend that would still resolve it.
+        def blocked?(locale, key, options = EMPTY_HASH)
+          backends.each do |backend|
+            return true if backend.blocked?(locale, key, options)
+            result = catch(:exception) do
+              backend.translate(locale, key, Utils.except(options, :default))
+            end
+            return false unless result.nil? || result.is_a?(MissingTranslation)
+          end
+          false
         end
 
         def localize(locale, object, format = :default, options = EMPTY_HASH)
@@ -110,6 +164,16 @@ module I18n
           end
 
         private
+          # Raw subtree for a namespace lookup, including I18n::BLOCKED
+          # markers so that blocks from earlier backends can mask keys merged
+          # in from lower backends. Backends without their own +lookup+ (such
+          # as an inner Chain) fall back to the already-pruned translate
+          # result.
+          def raw_namespace(backend, locale, key, options)
+            subtree = backend.blocked_lookup(locale, key, options)
+            subtree.is_a?(Hash) || subtree.equal?(I18n::BLOCKED) ? subtree : {}
+          end
+
           # This is approximately what gets used in ActiveSupport.
           # However since we are not guaranteed to run in an ActiveSupport context
           # it is wise to have our own copy. We underscore it

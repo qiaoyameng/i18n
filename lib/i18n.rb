@@ -10,6 +10,7 @@ require 'i18n/interpolate/ruby'
 
 module I18n
   autoload :Backend, 'i18n/backend'
+  autoload :AliasCheck, 'i18n/alias_check'
   autoload :Config,  'i18n/config'
   autoload :Gettext, 'i18n/gettext'
   autoload :Locale,  'i18n/locale'
@@ -261,6 +262,14 @@ module I18n
       translate(key, **options, raise: true)
     end
     alias :t! :translate!
+
+    # Statically checks Symbol translation links from +locale+ and +namespace+.
+    # Proc values are reported as runtime decisions and are never evaluated.
+    def check_aliases(locale = nil, namespace = nil, **options)
+      locale ||= config.locale
+      config.backend.check_aliases(locale, namespace, **options)
+    end
+    alias :alias_check :check_aliases
 
     # Returns an array of interpolation keys for the given translation key
     #

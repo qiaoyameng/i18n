@@ -51,6 +51,44 @@ module I18n
         @links ||= I18n.new_double_nested_cache
       end
 
+      def alias_check_translations
+        data = alias_check_deep_dup(translations)
+
+        links.each_pair do |locale, links_for_locale|
+          locale_data = data[locale] ||= {}
+
+          links_for_locale.each_pair do |key, target|
+            parts = key.split(FLATTEN_SEPARATOR).map do |part|
+              part.tr(SEPARATOR_ESCAPE_CHAR, FLATTEN_SEPARATOR).to_sym
+            end
+            current = locale_data
+
+            parts.each_with_index do |part, index|
+              if index == parts.size - 1
+                current[part] = target.to_sym
+              else
+                current = current[part] ||= {}
+              end
+            end
+          end
+        end
+
+        data
+      end
+
+      def alias_check_deep_dup(value)
+        case value
+        when Hash
+          value.each_with_object(value.class.new) do |(key, item), result|
+            result[alias_check_deep_dup(key)] = alias_check_deep_dup(item)
+          end
+        when Array
+          value.map { |item| alias_check_deep_dup(item) }
+        else
+          value
+        end
+      end
+
       # Flatten keys for nested Hashes by chaining up keys:
       #
       #   >> { "a" => { "b" => { "c" => "d", "e" => "f" }, "g" => "h" }, "i" => "j"}.wind

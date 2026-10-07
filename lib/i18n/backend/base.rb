@@ -72,6 +72,17 @@ module I18n
         lookup(locale, key, options[:scope]) != nil
       end
 
+      # Returns static alias analysis without resolving translations or Procs.
+      def check_aliases(locale, namespace = nil, **options)
+        I18n::AliasCheck.run(self, locale, namespace, **options)
+      end
+      alias :alias_check :check_aliases
+
+      def alias_check_translations
+        send(:init_translations) if respond_to?(:init_translations, true)
+        send(:translations)
+      end
+
       # Acts the same as +strftime+, but uses a localized version of the
       # format string. Takes a key from the date/time formats translations as
       # a format argument (<em>e.g.</em>, <tt>:short</tt> in <tt>:'date.formats'</tt>).

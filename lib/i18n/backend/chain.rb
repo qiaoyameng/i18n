@@ -79,6 +79,10 @@ module I18n
           end
         end
 
+        def alias_check_translations
+          send(:translations)
+        end
+
         def localize(locale, object, format = :default, options = EMPTY_HASH)
           backends.each do |backend|
             catch(:exception) do

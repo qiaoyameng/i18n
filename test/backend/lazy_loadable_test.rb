@@ -1,4 +1,5 @@
 require 'test_helper'
+require 'tmpdir'
 
 class I18nBackendLazyLoadableTest < I18n::TestCase
   def setup
@@ -189,6 +190,150 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     end
   end
 
+  test "lazy mode: a parse error in a later file does not publish partial translations" do
+    with_lazy_mode do
+      with_locale_files(
+        "en_one.yml" => "en:\n  first: value\n",
+        "en_two.yml" => "en:\n foo: foo\n    bar:\n"
+      ) do |files|
+        I18n.with_locale(:en) do
+          exception = assert_raises(I18n::InvalidLocaleData) do
+            @backend.lookup(:en, :first)
+          end
+
+          assert_equal files[1], exception.filename
+          assert_empty translations
+
+          File.write(files[1], "en:\n  second: value\n")
+
+          assert_equal "value", @backend.lookup(:en, :first)
+          assert_equal "value", @backend.lookup(:en, :second)
+        end
+      end
+    end
+  end
+
+  test "lazy mode: a filename mismatch does not publish translations from an earlier file" do
+    with_lazy_mode do
+      with_locale_files(
+        "en_one.yml" => "en:\n  first: value\n",
+        "en_two.yml" => "fr:\n  dog: chien\n"
+      ) do |files|
+        I18n.with_locale(:en) do
+          exception = assert_raises(I18n::InvalidFilenames) do
+            @backend.lookup(:en, :first)
+          end
+
+          assert_includes exception.message, files[1]
+          assert_empty translations
+        end
+      end
+    end
+  end
+
+  test "lazy mode: a failed reload keeps serving the previous version" do
+    with_lazy_mode do
+      with_locale_files("en_one.yml" => "en:\n  old: value\n") do |files, dir|
+        I18n.with_locale(:en) do
+          assert_equal "value", @backend.lookup(:en, :old)
+
+          invalid_file = File.join(dir, "en_two.yml")
+          File.write(invalid_file, "en:\n foo: foo\n    bar:\n")
+          I18n.load_path << invalid_file
+          @backend.reload!
+
+          assert_equal "value", @backend.lookup(:en, :old)
+          refute_predicate @backend, :initialized?
+
+          File.write(files.first, "en:\n  first: value\n")
+          File.write(invalid_file, "en:\n  new: value\n")
+
+          assert_nil @backend.lookup(:en, :old)
+          assert_equal "value", @backend.lookup(:en, :new)
+        end
+      end
+    end
+  end
+
+  test "lazy mode: locales load independently when one locale is invalid" do
+    with_lazy_mode do
+      with_locale_files(
+        "en_one.yml" => "en:\n  first: value\n",
+        "en_two.yml" => "en:\n foo: foo\n    bar:\n",
+        "fr_one.yml" => "fr:\n  dog: chien\n"
+      ) do |files|
+        I18n.with_locale(:en) do
+          assert_raises(I18n::InvalidLocaleData) do
+            @backend.lookup(:en, :first)
+          end
+        end
+
+        assert_equal "chien", @backend.lookup(:fr, :dog)
+        assert_equal [:fr], translations.keys
+
+        File.write(files[1], "en:\n  second: value\n")
+
+        assert_equal "value", @backend.lookup(:en, :first)
+        assert_equal "value", @backend.lookup(:en, :second)
+      end
+    end
+  end
+
+  test "lazy mode: reads during a reload see only the complete old or new version" do
+    with_lazy_mode do
+      with_locale_files("en_one.yml" => "en:\n  old: value\n") do |_files, dir|
+        first_file = File.join(dir, "en_one.yml")
+        second_file = File.join(dir, "en_two.yml")
+
+        I18n.with_locale(:en) do
+          assert_equal "value", @backend.lookup(:en, :old)
+        end
+
+        File.write(first_file, "en:\n  first: value\n")
+        File.write(second_file, "en:\n  second: value\n")
+        I18n.load_path << second_file
+        @backend.reload!
+
+        parsed = Queue.new
+        release = Queue.new
+        instrumenter = Module.new do
+          define_method(:load_translation_file) do |translation_loader, file|
+            result = super(translation_loader, file)
+            if file == first_file
+              parsed << true
+              release.pop
+            end
+            result
+          end
+        end
+        @backend.singleton_class.prepend(instrumenter)
+
+        reloader = Thread.new do
+          I18n.with_locale(:en) do
+            @backend.lookup(:en, :first)
+          end
+        end
+
+        parsed.pop
+
+        begin
+          I18n.with_locale(:en) do
+            assert_equal "value", @backend.lookup(:en, :old)
+            assert_nil @backend.lookup(:en, :first)
+            assert_nil @backend.lookup(:en, :second)
+          end
+        ensure
+          release << true
+        end
+
+        assert_equal "value", reloader.value
+        assert_nil @backend.lookup(:en, :old)
+        assert_equal "value", @backend.lookup(:en, :first)
+        assert_equal "value", @backend.lookup(:en, :second)
+      end
+    end
+  end
+
   private
 
   def with_lazy_mode
@@ -203,6 +348,19 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     yield
   end
 
+  def with_locale_files(files)
+    Dir.mktmpdir do |dir|
+      paths = files.map do |name, contents|
+        File.join(dir, name).tap { |path| File.write(path, contents) }
+      end
+
+      I18n.load_path = []
+      @backend.reload!
+      I18n.load_path.concat(paths)
+
+      yield(paths, dir)
+    end
+  end
 
   def with_translation_file_in_load_path(name, tmpdir, file_contents)
     @backend.reload!
@@ -220,4 +378,3 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     I18n.load_path.delete(locale_file.path)
   end
 end
-

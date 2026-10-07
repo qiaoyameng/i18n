@@ -65,12 +65,14 @@ module I18n
     class LazyLoadable < Simple
       def initialize(lazy_load: false)
         @lazy_load = lazy_load
+        @locale_mutexes = Concurrent::Map.new
+        @locale_mutexes_mutex = Mutex.new
       end
 
       # Returns whether the current locale is initialized.
-      def initialized?
+      def initialized?(locale = I18n.locale)
         if lazy_load?
-          initialized_locales[I18n.locale]
+          initialized_locales[locale]
         else
           super
         end
@@ -79,8 +81,9 @@ module I18n
       # Clean up translations and uninitialize all locales.
       def reload!
         if lazy_load?
-          @initialized_locales = nil
-          @translations = nil
+          initialized_locales.each_key do |locale|
+            initialized_locales[locale] = false
+          end
         else
           super
         end
@@ -105,33 +108,26 @@ module I18n
       end
 
       def lookup(locale, key, scope = [], options = EMPTY_HASH)
-        if lazy_load?
-          I18n.with_locale(locale) do
-            super
-          end
-        else
-          super
-        end
+        super
       end
 
       protected
 
-
       # Load translations from files that belong to the current locale.
-      def init_translations
-        file_errors = if lazy_load?
-          initialized_locales[I18n.locale] = true
-          load_translations_and_collect_file_errors(filenames_for_current_locale)
+      def init_translations(locale = nil)
+        if lazy_load?
+          init_lazy_translations(locale)
         else
-          @initialized = true
-          load_translations_and_collect_file_errors(I18n.load_path)
-        end
+          translation_loader, file_errors = translation_loader_for(I18n.load_path, deep_dup_hash(translations))
+          raise InvalidFilenames.new(file_errors) unless file_errors.empty?
 
-        raise InvalidFilenames.new(file_errors) unless file_errors.empty?
+          translations.replace(translation_loader.translations)
+          @initialized = true
+        end
       end
 
       def initialized_locales
-        @initialized_locales ||= Hash.new(false)
+        @initialized_locales ||= Concurrent::Hash.new(false)
       end
 
       private
@@ -140,33 +136,114 @@ module I18n
         @lazy_load
       end
 
+      def init_lazy_translations(locale)
+        mutex = mutex_for_locale(locale)
+        return if initialized_locales[locale]
+
+        if mutex.try_lock
+          init_lazy_translations_under_lock(locale, mutex)
+        else
+          return if translations.key?(locale)
+
+          mutex.synchronize {}
+          init_lazy_translations(locale) unless initialized_locales[locale]
+        end
+      end
+
+      def init_lazy_translations_under_lock(locale, mutex)
+        has_version = translations.key?(locale)
+        return if initialized_locales[locale]
+
+        begin
+          candidate = load_translation_candidate(locale, filenames_for_locale(locale))
+          translations[locale] = candidate
+          initialized_locales[locale] = true
+        rescue StandardError
+          raise unless has_version
+        ensure
+          mutex.unlock
+        end
+      end
+
+      def mutex_for_locale(locale)
+        @locale_mutexes_mutex.synchronize do
+          @locale_mutexes.fetch_or_store(locale) { Mutex.new }
+        end
+      end
+
       class FilenameIncorrect < StandardError
         def initialize(file, expected_locale, unexpected_locales)
           super "#{file} can only load translations for \"#{expected_locale}\". Found translations for: #{unexpected_locales}."
         end
       end
 
-      # Loads each file supplied and asserts that the file only loads
-      # translations as expected by the name. The method returns a list of
-      # errors corresponding to offending files.
-      def load_translations_and_collect_file_errors(files)
+      class TranslationLoader
+        include Base
+
+        attr_reader :translations
+
+        def initialize(translations = {})
+          @translations = translations
+        end
+
+        def load_translation_file(file)
+          load_file(file)
+        end
+
+        def store_translations(locale, data, options = EMPTY_HASH)
+          locale = locale.to_sym
+          data = Utils.deep_symbolize_keys(data) unless options.fetch(:skip_symbolize_keys, false)
+          translations[locale] ||= {}
+          Utils.deep_merge!(translations[locale], data)
+        end
+      end
+
+      def translation_loader_for(files, translations = {})
+        translation_loader = TranslationLoader.new(translations)
         errors = []
 
-        load_translations(files) do |file, loaded_translations|
+        files.each do |file|
+          loaded_translations = load_translation_file(translation_loader, file)
           assert_file_named_correctly!(file, loaded_translations)
         rescue FilenameIncorrect => e
           errors << e
         end
 
-        errors
+        [translation_loader, errors]
       end
 
-      # Select all files from I18n load path that belong to current locale.
-      # These files must start with the locale identifier (ie. "en", "pt-BR"),
-      # followed by an "_" demarcation to separate proceeding text.
-      def filenames_for_current_locale
+      def load_translation_candidate(locale, files)
+        return {} if files.empty?
+
+        translation_loader, file_errors = translation_loader_for(files)
+
+        raise InvalidFilenames.new(file_errors) unless file_errors.empty?
+
+        raise InvalidLocaleData.new(files.first, 'expects it to return a hash, but does not') unless translation_loader.translations.key?(locale)
+
+        translation_loader.translations.fetch(locale)
+      end
+
+      def load_translation_file(translation_loader, file)
+        translation_loader.load_translation_file(file)
+      end
+
+      def deep_dup_hash(value)
+        case value
+        when Hash
+          value.each_with_object({}) do |(key, nested_value), result|
+            result[key] = deep_dup_hash(nested_value)
+          end
+        when Array
+          value.map { |item| deep_dup_hash(item) }
+        else
+          value
+        end
+      end
+
+      def filenames_for_locale(locale)
         I18n.load_path.flatten.select do |path|
-          LocaleExtractor.locale_from_path(path) == I18n.locale
+          LocaleExtractor.locale_from_path(path) == locale
         end
       end
 

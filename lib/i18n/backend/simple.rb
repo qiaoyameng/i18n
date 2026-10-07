@@ -25,7 +25,7 @@ module I18n
         # Mutex to ensure that concurrent translations loading will be thread-safe
         MUTEX = Mutex.new
 
-        def initialized?
+        def initialized?(locale = nil)
           @initialized ||= false
         end
 
@@ -80,7 +80,7 @@ module I18n
 
       protected
 
-        def init_translations
+        def init_translations(locale = nil)
           load_translations
           @initialized = true
         end
@@ -91,7 +91,7 @@ module I18n
         # into multiple keys, i.e. <tt>currency.format</tt> is regarded the same as
         # <tt>%w(currency format)</tt>.
         def lookup(locale, key, scope = [], options = EMPTY_HASH)
-          init_translations unless initialized?
+          init_translations(locale) unless initialized?(locale)
           keys = I18n.normalize_keys(locale, key, scope, options[:separator])
 
           keys.inject(translations) do |result, _key|

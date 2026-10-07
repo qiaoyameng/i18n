@@ -78,6 +78,7 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * Custom key/scope separator
 * Custom exception handlers
 * Extensible architecture with a swappable backend
+* Static analysis of Symbol aliases (cycle/dangling detection via `I18n.check_aliases`)
 
 ## Pluggable Features
 

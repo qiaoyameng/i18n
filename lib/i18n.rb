@@ -11,6 +11,7 @@ require 'i18n/interpolate/ruby'
 module I18n
   autoload :Backend, 'i18n/backend'
   autoload :Config,  'i18n/config'
+  autoload :AliasChecker, 'i18n/alias_checker'
   autoload :Gettext, 'i18n/gettext'
   autoload :Locale,  'i18n/locale'
   autoload :Tests,   'i18n/tests'
@@ -298,6 +299,37 @@ module I18n
       raise I18n::ArgumentError if (key.is_a?(String) && key.empty?) || key.nil?
 
       config.backend.exists?(locale, key, options)
+    end
+
+    # Statically analyzes the Symbol aliases ("alias" translations whose
+    # value is a Symbol pointing at another key) reachable from +scope+ in
+    # +locale+ and returns an I18n::AliasChecker::Report.
+    #
+    # The report lists alias cycles (including cycles spanning multiple
+    # locales through locale fallbacks), dangling alias targets and Proc
+    # translations, which are resolved at runtime and can therefore not be
+    # analyzed statically. Every finding comes with the full reference path
+    # leading to it. A cycle that is shared by several keys is reported only
+    # once, with every entry path into it.
+    #
+    # Keys and scopes are normalized with the given +separator+ (defaulting
+    # to I18n.default_separator) and alias targets are resolved through the
+    # locale fallback chain when the backend includes
+    # I18n::Backend::Fallbacks, mirroring regular lookups. The analysis is
+    # read-only: translations are never resolved, interpolated or modified.
+    #
+    # *Examples*
+    #
+    #   I18n.backend.store_translations(:en, :foo => :bar, :bar => :foo, :baz => :missing)
+    #   report = I18n.check_aliases(:en)
+    #   report.cycles.first.nodes    # => ["en:bar", "en:foo"]
+    #   report.dangling.first.target # => "en:missing"
+    #   report.clean?                # => false
+    def check_aliases(_locale = nil, locale: _locale, scope: nil, separator: nil)
+      locale ||= config.locale
+      raise Disabled.new('check_aliases') if locale == false
+
+      AliasChecker.new(config.backend, locale, :scope => scope, :separator => separator).check
     end
 
     # Transliterates UTF-8 characters to ASCII. By default this method will

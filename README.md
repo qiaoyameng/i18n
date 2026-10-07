@@ -66,6 +66,34 @@ I18n.config.with(locale: :ja).set!
 `set!` stores a frozen config in the current execution context.
 This keeps inherited state safe and lets updates happen by replacing config objects.
 
+### Tracing translation resolution
+
+With chained backends and locale fallbacks it can be hard to explain why a
+particular translation was returned. Pass `trace: true` to record how a
+single call was resolved:
+
+```ruby
+I18n.t(:welcome, locale: :de, trace: true) # => "normal translation"
+puts I18n.last_trace
+# - I18n::Backend::Chain locale=:de key=:welcome => hit
+#   - I18n::Backend::Simple locale=:de key=:welcome => missing
+#   - I18n::Backend::Simple locale=:de key=:welcome => hit
+#     - I18n::Backend::Simple locale=:de key=:welcome => missing
+#     - I18n::Backend::Simple locale=:en key=:welcome => hit
+```
+
+The trace records every backend, locale and key that was actually tried,
+symbol alias jumps, default usage, the selected pluralization branch and the
+final hit location (`I18n.last_trace.final_hit`). Nested translations (e.g.
+from symbol aliases) appear as child nodes, and missing translations,
+exceptions and `fallback: false` all produce complete end records.
+
+Tracing never re-runs lookups, Procs or interpolation to build its records,
+and it does not change any lookup semantics. Interpolation values are kept
+out of the record by default; use `I18n::Trace.new(include_values: true)` and
+pass it as `trace:` to include them. Traces are isolated per fiber/thread, so
+concurrent and untraced calls are unaffected.
+
 ## Features
 
 * Translation and localization

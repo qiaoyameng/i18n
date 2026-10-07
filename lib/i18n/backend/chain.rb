@@ -54,6 +54,12 @@ module I18n
         end
 
         def translate(locale, key, default_options = EMPTY_HASH)
+          I18n::Trace.trace_lookup(self, locale, key, default_options) do
+            translate_across_chain(locale, key, default_options)
+          end
+        end
+
+        def translate_across_chain(locale, key, default_options = EMPTY_HASH) # :nodoc:
           namespace = nil
           options = Utils.except(default_options, :default)
 

@@ -53,6 +53,7 @@ module I18n
 
         fallback_options = options.merge(:fallback_in_progress => true, fallback_original_locale: locale)
         I18n.fallbacks[locale].each do |fallback|
+          I18n::Trace.record_event(:fallback, :from => locale, :to => fallback) if locale.to_s != fallback.to_s
           begin
             catch(:exception) do
               result = super(fallback, key, fallback_options)
@@ -72,6 +73,14 @@ module I18n
         throw(:exception, I18n::MissingTranslation.new(locale, key, options))
       end
 
+      alias_method :translate_with_fallback_resolution, :translate
+
+      def translate(locale, key, options = EMPTY_HASH)
+        I18n::Trace.trace_lookup(self, locale, key, options) do
+          translate_with_fallback_resolution(locale, key, options)
+        end
+      end
+
       def resolve_entry(locale, object, subject, options = EMPTY_HASH)
         return subject if options[:resolve] == false
         result = catch(:exception) do
@@ -79,12 +88,14 @@ module I18n
 
           case subject
           when Symbol
+            I18n::Trace.record_event(:alias, :from => object, :to => subject)
             I18n.translate(subject, **options.merge(
               :locale => options[:fallback_original_locale],
               :throw => true,
               :skip_interpolation => true
             ))
           when Proc
+            I18n::Trace.record_event(:proc, :key => object)
             date_or_time = options.delete(:object) || object
             resolve_entry(options[:fallback_original_locale], object, subject.call(date_or_time, **options))
           else

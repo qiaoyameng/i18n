@@ -26,6 +26,12 @@ module I18n
       end
 
       def translate(locale, key, options = EMPTY_HASH)
+        I18n::Trace.trace_lookup(self, locale, key, options) do
+          translate_without_trace(locale, key, options)
+        end
+      end
+
+      def translate_without_trace(locale, key, options = EMPTY_HASH) # :nodoc:
         raise I18n::ArgumentError if (key.is_a?(String) || key.is_a?(Symbol)) && key.empty?
         raise InvalidLocale.new(locale) unless locale
         return nil if key.nil? && !options.key?(:default)
@@ -56,7 +62,9 @@ module I18n
         deep_interpolation = options[:deep_interpolation]
         skip_interpolation = options[:skip_interpolation]
         values = Utils.except(options, *RESERVED_KEYS) unless options.empty?
+        I18n::Trace.record_entry(entry)
         if !skip_interpolation && values && !values.empty?
+          I18n::Trace.record_event(:interpolate, :keys => values.keys, :values => values)
           entry = if deep_interpolation
             deep_interpolate(locale, entry, values)
           else
@@ -135,10 +143,12 @@ module I18n
           case subject
           when Array
             subject.each do |item|
+              I18n::Trace.record_event(:default, :default => item)
               result = resolve(locale, object, item, options)
               return result unless result.nil?
             end and nil
           else
+            I18n::Trace.record_event(:default, :default => subject)
             resolve(locale, object, subject, options)
           end
         end
@@ -152,6 +162,7 @@ module I18n
           result = catch(:exception) do
             case subject
             when Symbol
+              I18n::Trace.record_event(:alias, :from => object, :to => subject)
               I18n.translate(
                 subject,
                 **options.merge(
@@ -161,6 +172,7 @@ module I18n
                 )
               )
             when Proc
+              I18n::Trace.record_event(:proc, :key => object)
               date_or_time = options.delete(:object) || object
               resolve(locale, object, subject.call(date_or_time, **options))
             else
@@ -185,6 +197,7 @@ module I18n
 
           key = pluralization_key(entry, count)
           raise InvalidPluralizationData.new(entry, count, key) unless entry.has_key?(key)
+          I18n::Trace.record_event(:pluralize, :key => key, :count => count)
           entry[key]
         end
 

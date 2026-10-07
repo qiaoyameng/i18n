@@ -15,6 +15,7 @@ module I18n
   autoload :Locale,  'i18n/locale'
   autoload :Tests,   'i18n/tests'
   autoload :Middleware,   'i18n/middleware'
+  autoload :Trace,   'i18n/trace'
 
   RESERVED_KEYS = %i[
     cascade
@@ -238,7 +239,26 @@ module I18n
     #  I18n.t(:salutation, { :gender => 'w', :name => 'Smith' })
     #  I18n.t(:salutation, any_hash)
     #
-    def translate(key = nil, throw: false, raise: false, locale: nil, **options) # TODO deprecate :raise
+    # Pass <tt>:trace => true</tt> to record a resolution trace for this
+    # single call (see I18n::Trace). The translation is returned as usual and
+    # the collected trace can be inspected through I18n.last_trace. An
+    # I18n::Trace instance can be passed instead to collect the trace
+    # directly:
+    #
+    #   I18n.t(:foo, :trace => true)
+    #   I18n.last_trace.final_hit  # => #<I18n::Trace::Node ...>
+    def translate(key = nil, throw: false, raise: false, locale: nil, trace: nil, **options) # TODO deprecate :raise
+      if trace && !I18n::Trace.current
+        tracer = trace.is_a?(I18n::Trace) ? trace : I18n::Trace.new
+        return tracer.trace do
+          begin
+            translate(key, :throw => throw, :raise => raise, :locale => locale, **options)
+          ensure
+            I18n::Trace.last = tracer
+          end
+        end
+      end
+
       locale ||= config.locale
       raise Disabled.new('t') if locale == false
       enforce_available_locales!(locale)
@@ -261,6 +281,13 @@ module I18n
       translate(key, **options, raise: true)
     end
     alias :t! :translate!
+
+    # Returns the trace collected by the most recent translate call that was
+    # made with the +:trace+ option on the current fiber/thread, or nil.
+    # See I18n::Trace.
+    def last_trace
+      I18n::Trace.last
+    end
 
     # Returns an array of interpolation keys for the given translation key
     #

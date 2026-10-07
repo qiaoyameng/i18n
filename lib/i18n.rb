@@ -317,6 +317,20 @@ module I18n
     # single string argument. Hash rules inherit the default transliteration
     # rules, while Procs do not.
     #
+    # Hash rules normally map single non-ASCII characters. Pass
+    # <tt>multi_char: true</tt> (or add a <tt>multi_char: true</tt> entry to the
+    # rule hash / translation data) to match source fragments of more than one
+    # character. At each position the longest matching fragment wins; fragments
+    # of the same length use the order in which the rules were given. Characters
+    # that do not start a match fall back to the single-character rules and then
+    # to the replacement character. Replacement output is never matched again.
+    #
+    # Pass <tt>nfc: true</tt> (or an <tt>nfc: true</tt> rule entry) to NFC
+    # normalize both the rules and the input, so decomposed input (an ASCII
+    # letter followed by combining marks) matches composed rules.
+    #
+    #    I18n.transliterate("chc", :locale => :xx, :multi_char => true)
+    #
     # *Examples*
     #
     # Setting a Hash in <locale>.yml:
@@ -351,12 +365,13 @@ module I18n
     #     I18n.transliterate("Jürgen") # => "Juergen"
     #     I18n.transliterate("Jürgen", :locale => :en) # => "Jurgen"
     #     I18n.transliterate("Jürgen", :locale => :de) # => "Juergen"
-    def transliterate(key, throw: false, raise: false, locale: nil, replacement: nil, **options)
+    def transliterate(key, throw: false, raise: false, locale: nil, replacement: nil,
+                      multi_char: nil, nfc: nil, **options)
       locale ||= config.locale
       raise Disabled.new('transliterate') if locale == false
       enforce_available_locales!(locale)
 
-      config.backend.transliterate(locale, key, replacement)
+      config.backend.transliterate(locale, key, replacement, multi_char, nfc)
     rescue I18n::ArgumentError => exception
       handle_exception((throw && :throw || raise && :raise), exception, locale, key, options)
     end

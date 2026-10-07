@@ -8,17 +8,20 @@ module I18n
 
       # Given a locale and a UTF-8 string, return the locale's ASCII
       # approximation for the string.
-      def transliterate(locale, string, replacement = nil)
+      def transliterate(locale, string, replacement = nil, nfc = nil)
         @transliterators ||= {}
-        @transliterators[locale] ||= Transliterator.get I18n.t(:'i18n.transliterate.rule',
-          :locale => locale, :resolve => false, :default => {})
-        @transliterators[locale].transliterate(string, replacement)
+        @transliterators[[locale, nfc]] ||= Transliterator.get(
+          I18n.t(:'i18n.transliterate.rule',
+            :locale => locale, :resolve => false, :default => {}),
+          :nfc => nfc
+        )
+        @transliterators[[locale, nfc]].transliterate(string, replacement)
       end
 
       # Get a transliterator instance.
-      def self.get(rule = nil)
+      def self.get(rule = nil, nfc: nil)
         if !rule || rule.kind_of?(Hash)
-          HashTransliterator.new(rule)
+          HashTransliterator.new(rule, :nfc => nfc)
         elsif rule.kind_of? Proc
           ProcTransliterator.new(rule)
         else
@@ -40,6 +43,12 @@ module I18n
       # A transliterator which accepts a Hash of characters as its translation
       # rule.
       class HashTransliterator
+        # Rule hash key which, when set to a truthy value, makes the
+        # transliterator NFC-normalize both the rules and the input. This
+        # allows decomposed sequences (e.g. "u" + COMBINING DIAERESIS) to match
+        # their composed equivalents.
+        NFC_OPTION_KEY = "i18n:nfc"
+
         DEFAULT_APPROXIMATIONS = {
           "À"=>"A", "Á"=>"A", "Â"=>"A", "Ã"=>"A", "Ä"=>"A", "Å"=>"A", "Æ"=>"AE",
           "Ç"=>"C", "È"=>"E", "É"=>"E", "Ê"=>"E", "Ë"=>"E", "Ì"=>"I", "Í"=>"I",
@@ -72,35 +81,137 @@ module I18n
           "ǭ"=>"o"
         }.freeze
 
-        def initialize(rule = nil)
-          @rule = rule
+        def initialize(rule = nil, nfc: nil)
+          @trie = RuleTrie.new
+          @nfc = nfc.nil? ? nfc_option(rule) : nfc
+          add(rule) if rule
           add_default_approximations
-          add rule if rule
         end
 
         def transliterate(string, replacement = nil)
           replacement ||= DEFAULT_REPLACEMENT_CHAR
-          string.gsub(/[^\x00-\x7f]/u) do |char|
-            approximations[char] || (replacement == :none ? char : replacement)
+          input = @nfc ? string.unicode_normalize(:nfc) : string
+          # Raise ArgumentError for invalid UTF-8, like a UTF-8 regex match does.
+          input.unpack("U*")
+
+          chars = input.each_char.to_a
+          output = String.new
+          index = 0
+
+          while index < chars.length
+            value, length = @trie.match(chars, index)
+
+            if value
+              output << value
+              index += length
+            else
+              char = chars[index]
+              if char.ascii_only? || replacement == :none
+                output << char
+              else
+                output << replacement
+              end
+              index += 1
+            end
           end
+
+          output
         end
 
         private
 
-        def approximations
-          @approximations ||= {}
+        # Add transliteration rules to the trie. They are inserted before the
+        # default approximations (see #add_default_approximations), so an
+        # explicit rule always shadows a default one and the first rule wins
+        # when several keys normalize to the same NFC sequence.
+        def add(hash)
+          hash.each do |key, value|
+            next if option_key?(key)
+            normalized_key = normalize_key(key)
+            if normalized_key.empty?
+              raise I18n::ArgumentError, "Transliteration rule keys cannot be empty."
+            end
+            @trie.add(normalized_key, value.to_s)
+          end
         end
 
         def add_default_approximations
           DEFAULT_APPROXIMATIONS.each do |key, value|
-            approximations[key] = value
+            @trie.add(key, value)
           end
         end
 
-        # Add transliteration rules to the approximations hash.
-        def add(hash)
+        def normalize_key(key)
+          normalized_key = key.to_s
+          @nfc ? normalized_key.unicode_normalize(:nfc) : normalized_key
+        end
+
+        def nfc_option(hash)
+          return false unless hash.kind_of?(Hash)
           hash.each do |key, value|
-            approximations[key.to_s] = value.to_s
+            return value if option_key?(key)
+          end
+          false
+        end
+
+        def option_key?(key)
+          key.is_a?(Symbol) || key.is_a?(String) ? key.to_s == NFC_OPTION_KEY : false
+        end
+
+        # A trie of rule source fragments. Matching walks the longest path
+        # whose node carries a replacement, so transliterating one position
+        # never scans the whole rule set.
+        class RuleTrie
+          class Node
+            def initialize
+              @children = nil
+              @value = nil
+            end
+
+            def [](char)
+              @children && @children[char]
+            end
+
+            def []=(char, node)
+              (@children ||= {})[char] = node
+            end
+
+            attr_accessor :value
+          end
+
+          def initialize
+            @root = Node.new
+          end
+
+          # Insert the first replacement registered for a fragment.
+          def add(fragment, replacement)
+            node = @root
+            fragment.each_char do |char|
+              node = (node[char] ||= Node.new)
+            end
+            node.value ||= replacement
+          end
+
+          # Return [replacement, matched_character_count] for the longest
+          # fragment starting at +index+, or [nil, 0] when nothing matches.
+          def match(chars, index)
+            node = @root
+            replacement = nil
+            matched_length = 0
+            scan = index
+
+            while scan < chars.length
+              child = node[chars[scan]]
+              break unless child
+              node = child
+              scan += 1
+              if node.value
+                replacement = node.value
+                matched_length = scan - index
+              end
+            end
+
+            [replacement, matched_length]
           end
         end
       end

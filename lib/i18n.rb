@@ -345,18 +345,42 @@ module I18n
     #
     # Transliterating strings:
     #
-    #     I18n.locale = :en
-    #     I18n.transliterate("Jürgen") # => "Jurgen"
-    #     I18n.locale = :de
-    #     I18n.transliterate("Jürgen") # => "Juergen"
-    #     I18n.transliterate("Jürgen", :locale => :en) # => "Jurgen"
-    #     I18n.transliterate("Jürgen", :locale => :de) # => "Juergen"
-    def transliterate(key, throw: false, raise: false, locale: nil, replacement: nil, **options)
+#     I18n.locale = :en
+#     I18n.transliterate("Jürgen") # => "Jurgen"
+#     I18n.locale = :de
+#     I18n.transliterate("Jürgen") # => "Juergen"
+#     I18n.transliterate("Jürgen", :locale => :en) # => "Jurgen"
+#     I18n.transliterate("Jürgen", :locale => :de) # => "Juergen"
+    #
+    # Hash rules may contain multi-character source fragments. At every
+    # position the longest matching fragment is used, and fragments of equal
+    # length keep the first rule defined. Fragments may contain ASCII,
+    # combining marks and supplementary plane characters; empty keys are not
+    # allowed. Replacement text is emitted verbatim and is never matched
+    # again:
+    #
+    #     store_translations(:de, i18n: {
+    #                          transliterate: {
+    #                            rule: {
+    #                              'sch' => 'sh',
+    #                              'ü' => 'ue'
+    #                            }
+    #                          }
+    #                        })
+    #     I18n.transliterate("Schüssel".downcase, :locale => :de) # => "shuessel"
+    #
+    # Pass +nfc: true+ (or set the +i18n:nfc+ key in the rule hash) to
+    # NFC-normalize both the rules and the input before matching, so that
+    # decomposed sequences ("u" followed by a combining diaeresis) match their
+    # composed equivalents:
+    #
+    #     I18n.transliterate(decomposed, :locale => :de, :nfc => true)
+    def transliterate(key, throw: false, raise: false, locale: nil, replacement: nil, nfc: nil, **options)
       locale ||= config.locale
       raise Disabled.new('transliterate') if locale == false
       enforce_available_locales!(locale)
 
-      config.backend.transliterate(locale, key, replacement)
+      config.backend.transliterate(locale, key, replacement, nfc)
     rescue I18n::ArgumentError => exception
       handle_exception((throw && :throw || raise && :raise), exception, locale, key, options)
     end

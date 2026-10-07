@@ -7,6 +7,7 @@ require 'i18n/version'
 require 'i18n/utils'
 require 'i18n/exceptions'
 require 'i18n/interpolate/ruby'
+require 'i18n/trace'
 
 module I18n
   autoload :Backend, 'i18n/backend'
@@ -31,6 +32,7 @@ module I18n
     resolve
     scope
     separator
+    trace
     throw
   ]
   EMPTY_HASH = {}.freeze
@@ -238,22 +240,77 @@ module I18n
     #  I18n.t(:salutation, { :gender => 'w', :name => 'Smith' })
     #  I18n.t(:salutation, any_hash)
     #
-    def translate(key = nil, throw: false, raise: false, locale: nil, **options) # TODO deprecate :raise
+    def translate(key = nil, throw: false, raise: false, locale: nil, trace: nil, **options) # TODO deprecate :raise
       locale ||= config.locale
       raise Disabled.new('t') if locale == false
       enforce_available_locales!(locale)
 
       backend = config.backend
 
-      if key.is_a?(Array)
-        key.map do |k|
-          translate_key(k, throw, raise, locale, backend, options)
+      # Tracing is enabled per call through the +trace:+ option. The active
+      # trace lives in Fiber local storage, so concurrent requests and
+      # untraced calls stay isolated. A lookup already running inside an
+      # active trace joins it as a nested node.
+      tracer, new_trace = resolve_tracer(trace)
+      perform = ->(_active_trace = nil) {
+        if key.is_a?(Array)
+          if tracer
+            tracer.wrap(:translate, key: key, locale: locale, scope: options[:scope], bulk: true) do
+              key.map do |k|
+                tracer.wrap(:translate, key: k, locale: locale, scope: options[:scope]) do
+                  translate_key(k, throw, raise, locale, backend, options)
+                end
+              end
+            end
+          else
+            key.map { |k| translate_key(k, throw, raise, locale, backend, options) }
+          end
+        elsif tracer
+          tracer.wrap(:translate, key: key, locale: locale, scope: options[:scope]) do
+            translate_key(key, throw, raise, locale, backend, options)
+          end
+        else
+          translate_key(key, throw, raise, locale, backend, options)
         end
+      }
+      if trace == false
+        Trace.suppress(&perform)
+      elsif new_trace
+        Trace.activate(tracer, &perform)
       else
-        translate_key(key, throw, raise, locale, backend, options)
+        perform.call
       end
     end
     alias :t :translate
+
+    # Same as #translate but also returns the collected Trace:
+    #
+    #   result, trace = I18n.translate_with_trace(:foo)
+    #
+    # The translation result is identical to what #translate returns. Pass
+    # <tt>capture_values: false</tt> to record value classes without the
+    # resolved translation values. Interpolation values are never recorded.
+    def translate_with_trace(key = nil, capture_values: true, **options)
+      tracer = Trace.new(capture_values: capture_values)
+      result = Trace.activate(tracer) do
+        translate(key, trace: tracer, **options)
+      end
+      [result, tracer]
+    end
+    alias :t_with_trace :translate_with_trace
+
+    # Runs the block with a fresh Trace active, so any I18n lookups performed
+    # inside it are recorded (including nested or implicit ones). Returns the
+    # block's return value together with the trace:
+    #
+    #   result, trace = I18n.with_trace { I18n.t(:foo) }
+    def with_trace(capture_values: true)
+      raise ArgumentError, 'a block is required' unless block_given?
+
+      tracer = Trace.new(capture_values: capture_values)
+      result = Trace.activate(tracer) { yield(tracer) }
+      [result, tracer]
+    end
 
     # Wrapper for <tt>translate</tt> that adds <tt>:raise => true</tt>. With
     # this option, if no translation is found, it will raise <tt>I18n::MissingTranslationData</tt>
@@ -419,12 +476,37 @@ module I18n
 
   private
 
+    # Returns [tracer, needs_activation]. When a fresh trace is returned it
+    # must be installed in Fiber local storage around the lookup.
+    def resolve_tracer(trace_option)
+      return [nil, false] if trace_option == false
+
+      case trace_option
+      when nil
+        [Trace.current, false]
+      when true
+        Trace.current ? [Trace.current, false] : [Trace.new, true]
+      when Trace
+        if Trace.current.equal?(trace_option)
+          [trace_option, false]
+        elsif Trace.current.nil?
+          [trace_option, true]
+        else
+          # An outer trace is active; join it instead of replacing it.
+          [Trace.current, false]
+        end
+      else
+        raise ArgumentError, "invalid :trace option: #{trace_option.inspect}"
+      end
+    end
+
     def translate_key(key, throw, raise, locale, backend, options)
       result = catch(:exception) do
         backend.translate(locale, key, options)
       end
 
       if result.is_a?(MissingTranslation)
+        Trace.current&.mark_handled_missing(result)
         handle_exception((throw && :throw || raise && :raise), result, locale, key, options)
       else
         result

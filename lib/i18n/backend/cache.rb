@@ -77,23 +77,29 @@ module I18n
   module Backend
     # TODO Should the cache be cleared if new translations are stored?
     module Cache
-      def translate(locale, key, options = EMPTY_HASH)
-        I18n.perform_caching? ? fetch(cache_key(locale, key, options)) { super } : super
-      end
+        def translate(locale, key, options = EMPTY_HASH)
+          I18n.perform_caching? ? fetch(cache_key(locale, key, options), locale, key, options) { super } : super
+        end
 
-      protected
+        protected
 
-        def fetch(cache_key, &block)
-          result = _fetch(cache_key, &block)
+        def fetch(cache_key, locale, key, options, &block)
+          result = _fetch(cache_key, locale, key, options, &block)
           throw(:exception, result) if result.is_a?(MissingTranslation)
           result = result.dup if result.frozen? rescue result
           result
         end
 
-        def _fetch(cache_key, &block)
+        def _fetch(cache_key, locale, key, options, &block)
           result = I18n.cache_store.read(cache_key)
-          return result unless result.nil?
+          if !result.nil?
+            I18n::Trace.current&.wrap(:cache, backend: I18n::Trace.backend_name(self),
+                                              locale: locale, key: key, scope: options[:scope],
+                                              cache: :hit) { result }
+            return result
+          end
           result = catch(:exception, &block)
+          I18n::Trace.current&.annotate(cache: :miss)
           I18n.cache_store.write(cache_key, result) unless result.is_a?(Proc)
           result
         end

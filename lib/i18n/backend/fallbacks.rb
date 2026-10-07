@@ -52,13 +52,34 @@ module I18n
         default = extract_non_symbol_default!(options) if options[:default]
 
         fallback_options = options.merge(:fallback_in_progress => true, fallback_original_locale: locale)
-        I18n.fallbacks[locale].each do |fallback|
+        tracer = I18n::Trace.current
+        I18n.fallbacks[locale].each_with_index do |fallback, fallback_index|
           begin
-            catch(:exception) do
-              result = super(fallback, key, fallback_options)
-              unless result.nil?
-                on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
-                return result
+            if tracer
+              attributes = {
+                backend: I18n::Trace.backend_name(self),
+                locale: fallback,
+                original_locale: locale,
+                key: key,
+                scope: options[:scope],
+                fallback_index: fallback_index
+              }
+              catch(:exception) do
+                result = tracer.wrap(:fallback, attributes) do
+                  fallback_super_translate(fallback, key, fallback_options)
+                end
+                unless result.nil?
+                  on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
+                  return result
+                end
+              end
+            else
+              catch(:exception) do
+                result = super(fallback, key, fallback_options)
+                unless result.nil?
+                  on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
+                  return result
+                end
               end
             end
           rescue I18n::InvalidLocale
@@ -72,6 +93,12 @@ module I18n
         throw(:exception, I18n::MissingTranslation.new(locale, key, options))
       end
 
+      # Resolves the +translate+ implementation above Fallbacks at runtime so
+      # tracing wrappers do not have to thread +super+ through nested blocks.
+      def fallback_super_translate(locale, key, options)
+        method(:translate).super_method.call(locale, key, options)
+      end
+
       def resolve_entry(locale, object, subject, options = EMPTY_HASH)
         return subject if options[:resolve] == false
         result = catch(:exception) do
@@ -79,14 +106,35 @@ module I18n
 
           case subject
           when Symbol
-            I18n.translate(subject, **options.merge(
-              :locale => options[:fallback_original_locale],
-              :throw => true,
-              :skip_interpolation => true
-            ))
+            tracer = I18n::Trace.current
+            translation = -> {
+              I18n.translate(subject, **options.merge(
+                :locale => options[:fallback_original_locale],
+                :throw => true,
+                :skip_interpolation => true
+              ))
+            }
+            if tracer
+              tracer.wrap(:alias, {
+                locale: options[:fallback_original_locale],
+                key: subject,
+                alias_key: subject,
+                scope: options[:scope]
+              }) { translation.call }
+            else
+              translation.call
+            end
           when Proc
             date_or_time = options.delete(:object) || object
-            resolve_entry(options[:fallback_original_locale], object, subject.call(date_or_time, **options))
+            tracer = I18n::Trace.current
+            called = if tracer
+              tracer.wrap(:proc, locale: options[:fallback_original_locale], key: object, capture: false) do
+                subject.call(date_or_time, **options)
+              end
+            else
+              subject.call(date_or_time, **options)
+            end
+            resolve_entry(options[:fallback_original_locale], object, called)
           else
             subject
           end

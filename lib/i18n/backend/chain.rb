@@ -56,11 +56,23 @@ module I18n
         def translate(locale, key, default_options = EMPTY_HASH)
           namespace = nil
           options = Utils.except(default_options, :default)
+          tracer = I18n::Trace.current
 
           backends.each do |backend|
             catch(:exception) do
               options = default_options if backend == backends.last
-              translation = backend.translate(locale, key, options)
+              if tracer
+                translation = tracer.wrap(:backend, {
+                  backend: I18n::Trace.backend_name(backend),
+                  locale: locale,
+                  key: key,
+                  scope: options[:scope]
+                }) do
+                  backend.translate(locale, key, options)
+                end
+              else
+                translation = backend.translate(locale, key, options)
+              end
               if namespace_lookup?(translation, options)
                 namespace = _deep_merge(translation, namespace || {})
               elsif !translation.nil? || (options.key?(:default) && options[:default].nil?)

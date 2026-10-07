@@ -45,7 +45,9 @@ module I18n
           # Users that want a different string for the case of `count == 0` should use the explicit "0" key instead.
           # We keep this incorrect behaviour for now for backwards compatibility until we can remove it.
           # Ref: https://github.com/ruby-i18n/i18n/issues/629
-          return entry[:zero] if count == 0 && entry.has_key?(:zero)
+          if count == 0 && entry.has_key?(:zero)
+            return entry[:zero]
+          end
 
           # "0" and "1" are special cases
           # https://unicode-org.github.io/cldr/ldml/tr35-numbers.html#Explicit_0_1_rules

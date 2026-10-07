@@ -95,6 +95,41 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 
 For more information and lots of resources see [the 'Resources' page on the wiki](https://github.com/ruby-i18n/i18n/wiki/Resources).
 
+## Resolution Tracing
+
+With several backends, locale fallbacks, symbol links, Procs and defaults it
+can be hard to explain why a key resolved to a particular translation. You
+can collect a per-call resolution trace without changing the result:
+
+```ruby
+result, trace = I18n.translate_with_trace(:'errors.messages.blank', locale: :'de-DE')
+result # => the normal translation
+
+trace.final.location
+# => { backend: "I18n::Backend::Simple#1240", locale: :en, key: :"errors.messages.blank", scope: nil }
+```
+
+The trace records, for the single call only, the backends that were
+consulted (Chain order), the locales that were tried and their fallback
+order, symbol alias hops, Proc evaluations, defaults that were used, the
+pluralization branch and where the final value came from. Missing keys,
+exceptions and `fallback: false` produce closed records too.
+
+Other ways to enable tracing:
+
+```ruby
+I18n.t(:foo, trace: true)                 # activates a trace, available as I18n::Trace.current during the call
+result, trace = I18n.with_trace { I18n.t(:foo) }
+```
+
+Tracing never re-runs lookups, Procs or interpolation; it wraps the calls
+that already happen. Chain priority and the meaning of `false`/`nil` is
+preserved. Interpolation values passed by the caller are not stored in the
+trace. Pass `capture_values: false` to also omit the resolved translation
+values (value classes are still recorded). Tracing state is Fiber local, so
+concurrent requests and untraced calls are fully isolated. Use `trace: false`
+to keep a nested lookup out of an otherwise active trace.
+
 ## Tests
 
 You can run tests both with

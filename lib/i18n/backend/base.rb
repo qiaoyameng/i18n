@@ -30,6 +30,56 @@ module I18n
         raise InvalidLocale.new(locale) unless locale
         return nil if key.nil? && !options.key?(:default)
 
+        tracer = I18n::Trace.current
+        if tracer
+          tracer.wrap(:lookup, lookup_trace_attributes(locale, key, options)) do
+            translate_resolution(locale, key, options)
+          end
+        else
+          translate_resolution(locale, key, options)
+        end
+      end
+
+      def lookup_trace_attributes(locale, key, options)
+        {
+          backend: I18n::Trace.backend_name(self),
+          locale: locale,
+          original_locale: options[:fallback_original_locale],
+          key: key,
+          scope: options[:scope]
+        }
+      end
+
+      # Calls #pluralize inside a :plural trace entry. The selected branch is
+      # obtained from the (possibly overridden) pluralize implementation via
+      # #trace_plural_key without pluralizing a second time.
+      def trace_pluralize(locale, entry, key, count)
+        return entry unless count
+
+        tracer = I18n::Trace.current
+        return pluralize(locale, entry, count) unless tracer
+
+        plural_node = nil
+        result = tracer.wrap(:plural, locale: locale, key: key, count: count) do
+          plural_node = tracer.last_entry
+          pluralize(locale, entry, count)
+        end
+        selected = trace_plural_key(entry, count, result)
+        plural_node.plural_key = selected if selected && plural_node
+        result
+      end
+
+      # Determines which pluralization subkey the pluralize implementation
+      # selected, purely by inspecting the data it already used. Returns nil
+      # when it cannot be inferred.
+      def trace_plural_key(entry, count, result)
+        return nil unless entry.is_a?(Hash)
+
+        matching = entry.find { |_key, value| value.equal?(result) || value == result }
+        matching&.first
+      end
+
+      private def translate_resolution(locale, key, options)
         entry = lookup(locale, key, options[:scope], options) unless key.nil?
 
         if entry.nil? && options.key?(:default)
@@ -47,7 +97,7 @@ module I18n
         end
 
         entry = entry.dup if entry.is_a?(String)
-        entry = pluralize(locale, entry, count) if count
+        entry = trace_pluralize(locale, entry, key, count)
 
         if entry.nil? && !subtrees?
           throw(:exception, I18n::MissingTranslation.new(locale, key, options))
@@ -57,10 +107,23 @@ module I18n
         skip_interpolation = options[:skip_interpolation]
         values = Utils.except(options, *RESERVED_KEYS) unless options.empty?
         if !skip_interpolation && values && !values.empty?
-          entry = if deep_interpolation
-            deep_interpolate(locale, entry, values)
+          if I18n::Trace.current
+            # The resolved string embeds caller supplied values; make sure no
+            # open entry (lookup, fallback, backend, root) retains it.
+            I18n::Trace.current.suppress_value_capture!
+            entry = I18n::Trace.current.wrap(:interpolate, { locale: locale, key: key, capture: false }) do
+              if deep_interpolation
+                deep_interpolate(locale, entry, values)
+              else
+                interpolate(locale, entry, values)
+              end
+            end
           else
-            interpolate(locale, entry, values)
+            entry = if deep_interpolation
+              deep_interpolate(locale, entry, values)
+            else
+              interpolate(locale, entry, values)
+            end
           end
         elsif entry.is_a?(String) && entry =~ I18n.reserved_keys_pattern
           raise ReservedInterpolationKey.new($1.to_sym, entry)
@@ -135,11 +198,33 @@ module I18n
           case subject
           when Array
             subject.each do |item|
-              result = resolve(locale, object, item, options)
+              result = trace_default(locale, object, item, options) { resolve(locale, object, item, options) }
               return result unless result.nil?
             end and nil
           else
-            resolve(locale, object, subject, options)
+            trace_default(locale, object, subject, options) { resolve(locale, object, subject, options) }
+          end
+        end
+
+        def trace_default(locale, object, item, options, &resolution)
+          tracer = I18n::Trace.current
+          return yield unless tracer
+
+          attributes = {
+            locale: locale,
+            key: object,
+            scope: options[:scope],
+            default_type: I18n::Trace.default_type(item)
+          }
+          unless item.is_a?(Proc)
+            attributes[:default] = item
+          end
+          if item.is_a?(Proc)
+            # The :default entry is the parent; the actual Proc evaluation is
+            # recorded as a nested :proc entry by #resolve.
+            tracer.wrap(:default, attributes.merge(capture: false), &resolution)
+          else
+            tracer.wrap(:default, attributes, &resolution)
           end
         end
 
@@ -152,17 +237,27 @@ module I18n
           result = catch(:exception) do
             case subject
             when Symbol
-              I18n.translate(
-                subject,
-                **options.merge(
-                  :locale => locale,
-                  :throw => true,
-                  :skip_interpolation => true
+              trace_alias(locale, subject, options) do
+                I18n.translate(
+                  subject,
+                  **options.merge(
+                    :locale => locale,
+                    :throw => true,
+                    :skip_interpolation => true
+                  )
                 )
-              )
+              end
             when Proc
               date_or_time = options.delete(:object) || object
-              resolve(locale, object, subject.call(date_or_time, **options))
+              tracer = I18n::Trace.current
+              called = if tracer
+                tracer.wrap(:proc, locale: locale, key: object, capture: false) do
+                  subject.call(date_or_time, **options)
+                end
+              else
+                subject.call(date_or_time, **options)
+              end
+              resolve(locale, object, called)
             else
               subject
             end
@@ -170,6 +265,19 @@ module I18n
           result unless result.is_a?(MissingTranslation)
         end
         alias_method :resolve_entry, :resolve
+
+        def trace_alias(locale, subject, options)
+          tracer = I18n::Trace.current
+          return yield unless tracer
+
+          tracer.wrap(
+            :alias,
+            locale: locale,
+            key: subject,
+            alias_key: subject,
+            scope: options[:scope]
+          ) { yield }
+        end
 
         # Picks a translation from a pluralized mnemonic subkey according to English
         # pluralization rules :

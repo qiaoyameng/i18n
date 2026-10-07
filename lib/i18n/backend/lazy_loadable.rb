@@ -70,7 +70,7 @@ module I18n
       # Returns whether the current locale is initialized.
       def initialized?
         if lazy_load?
-          initialized_locales[I18n.locale]
+          initialized_locales.fetch(I18n.locale, false)
         else
           super
         end
@@ -80,7 +80,6 @@ module I18n
       def reload!
         if lazy_load?
           @initialized_locales = nil
-          @translations = nil
         else
           super
         end
@@ -107,6 +106,7 @@ module I18n
       def lookup(locale, key, scope = [], options = EMPTY_HASH)
         if lazy_load?
           I18n.with_locale(locale) do
+            init_locale_translations(locale) unless initialized?
             super
           end
         else
@@ -119,25 +119,149 @@ module I18n
 
       # Load translations from files that belong to the current locale.
       def init_translations
-        file_errors = if lazy_load?
-          initialized_locales[I18n.locale] = true
-          load_translations_and_collect_file_errors(filenames_for_current_locale)
-        else
-          @initialized = true
-          load_translations_and_collect_file_errors(I18n.load_path)
-        end
+        return if lazy_load?
+
+        @initialized = true
+        file_errors = load_translations_and_collect_file_errors(I18n.load_path)
 
         raise InvalidFilenames.new(file_errors) unless file_errors.empty?
       end
 
       def initialized_locales
-        @initialized_locales ||= Hash.new(false)
+        @initialized_locales ||= {}
       end
 
       private
 
       def lazy_load?
         @lazy_load
+      end
+
+      # Per-locale synchronization primitive that coalesces concurrent loads.
+      # The leader holds +mutex+ for the entire duration of its load, so
+      # followers simply block on mutex acquisition. +attempt+ is bumped on
+      # every finished load; a follower that observed an in-progress attempt
+      # records that attempt's number and neither waits for nor leads that
+      # same attempt again, even if it performs several lookups in a row.
+      LocaleLoad = Struct.new(:mutex, :condition, :leader, :attempt, :waiters) do
+        # Claims participation in a load. Returns a pair [role, attempt]:
+        #   * [:leader, n]  - the caller owns a new load attempt and must run it
+        #   * [:follower, n]- an attempt was running; the caller waited it out
+        #   * [:skip, n]    - the caller already witnessed attempt +n+, so it
+        #                      should just read the stored translations
+        def claim(thread, seen)
+          mutex.synchronize do
+            if leader
+              self.waiters += 1
+              condition.wait(mutex) while leader
+              self.waiters -= 1
+              [:follower, attempt]
+            elsif seen == attempt
+              [:skip, attempt]
+            else
+              self.leader = thread
+              [:leader, attempt]
+            end
+          end
+        end
+
+        def complete!
+          mutex.synchronize do
+            self.leader = nil
+            self.attempt += 1
+            condition.broadcast
+          end
+        end
+      end
+
+      # Load attempt number most recently witnessed by this thread for a
+      # locale, so concurrent follow-up lookups do not wait twice.
+      def seen_attempt(load)
+        (@seen_attempts ||= {})[load]
+      end
+
+      def remember_attempt!(load, attempt)
+        (@seen_attempts ||= {})[load] = attempt
+      end
+
+      # Atomically loads every translation file that belongs to the given
+      # locale. Files are first parsed and validated into an isolated hash.
+      # Only when all of them succeed is the new data published for the
+      # locale, replacing the previously visible version in a single swap.
+      # This guarantees that readers never observe a partially loaded
+      # dictionary or a mix of old and new files.
+      #
+      # Concurrent lookups for the same locale coalesce: the first lookup
+      # leads the load while the others wait for it to finish. Followers never
+      # raise: if the leader fails and an old version exists they are served
+      # that version by the subsequent lookup. The leader always reports the
+      # real error (with file information). On failure nothing is published
+      # and the locale stays uninitialized, so a subsequent lookup retries.
+      def init_locale_translations(locale)
+        return if initialized_locales[locale]
+
+        load = locale_load(locale)
+        role, attempt = load.claim(Thread.current, seen_attempt(load))
+        remember_attempt!(load, attempt)
+        return if role == :follower || role == :skip
+
+        begin
+          around_locale_load { load_locale_translations(locale) }
+        ensure
+          load.complete!
+        end
+      end
+
+      # Extension point wrapping the actual parsing of a locale's files.
+      # Override to observe an in-progress load; the default implementation
+      # simply yields.
+      def around_locale_load
+        yield
+      end
+
+      def load_locale_translations(locale)
+        candidate = {}
+        file_errors = []
+
+        filenames_for_locale(locale).each do |file|
+          data, keys_symbolized = parse_file(file)
+          assert_file_named_correctly!(file, data)
+          merge_into(candidate, data, keys_symbolized)
+        rescue FilenameIncorrect => e
+          file_errors << e
+        end
+
+        raise InvalidFilenames.new(file_errors) unless file_errors.empty?
+
+        # Loading failed (parse error or unsupported file type) before we get
+        # here: nothing has been published, so any previously visible version
+        # stays in place and the locale remains uninitialized for a retry.
+        publish_locale_translations(locale, candidate)
+        initialized_locales[locale] = true
+      end
+
+      # Merges parsed file data into the isolated candidate hash without
+      # touching the live translations store.
+      def merge_into(candidate, data, keys_symbolized)
+        data = Utils.deep_symbolize_keys(data) unless keys_symbolized
+        data.each { |file_locale, d| Utils.deep_merge!(candidate[file_locale] ||= {}, d || {}) }
+      end
+
+      # Replaces the locale's visible translations with the freshly parsed
+      # data in a single assignment. Using a brand new subtree means readers
+      # always observe either the complete old version or the complete new
+      # one, never an intermediate state.
+      def publish_locale_translations(locale, candidate)
+        new_data = candidate[locale] || {}
+        translations[locale] = Concurrent::Hash.new.merge!(new_data)
+      end
+
+      def locale_load(locale)
+        @locale_loads_mutex ||= Mutex.new
+        @locale_loads_mutex.synchronize do
+          @locale_loads ||= {}
+          @locale_loads[locale] ||= LocaleLoad.new(Mutex.new, ConditionVariable.new, nil, 0, 0)
+        end
       end
 
       class FilenameIncorrect < StandardError
@@ -164,9 +288,9 @@ module I18n
       # Select all files from I18n load path that belong to current locale.
       # These files must start with the locale identifier (ie. "en", "pt-BR"),
       # followed by an "_" demarcation to separate proceeding text.
-      def filenames_for_current_locale
+      def filenames_for_locale(locale)
         I18n.load_path.flatten.select do |path|
-          LocaleExtractor.locale_from_path(path) == I18n.locale
+          LocaleExtractor.locale_from_path(path) == locale
         end
       end
 

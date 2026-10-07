@@ -163,6 +163,136 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     end
   end
 
+  test "lazy mode: a failed first load publishes no keys and can be retried" do
+    with_lazy_mode do
+      with_locale_files("en_first.yml" => { en: { good: "key" } }.to_yaml,
+                        "en_second.yml" => { de: { bad: "key" } }.to_yaml) do |files|
+        exception = assert_raises(I18n::InvalidFilenames) { I18n.with_locale(:en) { I18n.t("good") } }
+
+        assert_match(/#{Regexp.escape(files["en_second.yml"])}/, exception.message)
+        assert_nil translations
+
+        rewrite_locale_file(files["en_second.yml"], { en: { bad: "fixed" } }.to_yaml)
+
+        assert_equal "key", I18n.with_locale(:en) { I18n.t("good") }
+        assert_equal "fixed", I18n.with_locale(:en) { I18n.t("bad") }
+      end
+    end
+  end
+
+  test "lazy mode: a YAML parse error in a later file leaves no partial dictionary and retries" do
+    with_lazy_mode do
+      with_locale_files("en_first.yml" => { en: { alpha: "one" } }.to_yaml,
+                        "en_second.yml" => "en:\n  beta: {oops\n") do |files|
+        exception = assert_raises(I18n::InvalidLocaleData) { I18n.with_locale(:en) { I18n.t("alpha") } }
+
+        assert_equal files["en_second.yml"], exception.filename
+        assert_nil translations
+
+        rewrite_locale_file(files["en_second.yml"], { en: { beta: "two" } }.to_yaml)
+
+        assert_equal "one", I18n.with_locale(:en) { I18n.t("alpha") }
+        assert_equal "two", I18n.with_locale(:en) { I18n.t("beta") }
+      end
+    end
+  end
+
+  test "lazy mode: a failed reload keeps serving the previously loaded version" do
+    with_lazy_mode do
+      with_locale_files("en_first.yml" => { en: { alpha: "one" } }.to_yaml,
+                        "en_second.yml" => { en: { beta: "two" } }.to_yaml) do |files|
+        assert_equal "one", I18n.with_locale(:en) { I18n.t("alpha") }
+        assert_equal "two", I18n.with_locale(:en) { I18n.t("beta") }
+
+        rewrite_locale_file(files["en_second.yml"], "en:\n  beta: {oops\n")
+        @backend.reload!
+
+        exception = assert_raises(I18n::InvalidLocaleData) { I18n.with_locale(:en) { I18n.t("alpha") } }
+        assert_equal files["en_second.yml"], exception.filename
+
+        assert_equal({ alpha: "one", beta: "two" }, translations[:en])
+
+        rewrite_locale_file(files["en_second.yml"], { en: { beta: "three" } }.to_yaml)
+        assert_equal "three", I18n.with_locale(:en) { I18n.t("beta") }
+      end
+    end
+  end
+
+  test "lazy mode: locales load and fail independently" do
+    with_lazy_mode do
+      with_locale_files("en_first.yml" => { en: { good: "key" } }.to_yaml,
+                        "en_second.yml" => { de: { bad: "key" } }.to_yaml,
+                        "fr.yml" => { fr: { animal: { dog: "chien" } } }.to_yaml) do
+        assert_equal "chien", I18n.with_locale(:fr) { I18n.t("animal.dog") }
+        assert_raises(I18n::InvalidFilenames) { I18n.with_locale(:en) { I18n.t("good") } }
+
+        assert(translations[:en].nil? || translations[:en].empty?)
+        assert_equal "chien", I18n.with_locale(:fr) { I18n.t("animal.dog") }
+      end
+    end
+  end
+
+  test "lazy mode: concurrent readers during a failed reload only see the complete old version" do
+    @backend = I18n.backend = I18n::Backend::LazyLoadable.new(lazy_load: true)
+    with_locale_files("en_first.yml" => { en: { alpha: "old_a", beta: "old_b" } }.to_yaml,
+                      "en_second.yml" => { en: { gamma: "old_c" } }.to_yaml) do |files|
+      backend = @backend
+      I18n.enforce_available_locales = false
+
+      assert_equal "old_a", I18n.with_locale(:en) { I18n.t("alpha") }
+
+      rewrite_locale_file(files["en_second.yml"], "en:\n  gamma: {oops\n")
+      backend.reload!
+
+      reader_count = 8
+      load_started = Queue.new
+      release_load = Queue.new
+      seen = {}
+      mutex = Mutex.new
+
+      # Park the leader once it has acquired the load but before it parses any
+      # file. Follower readers started afterwards block on the locale mutex.
+      # The leader is released while the followers are still blocked, so it
+      # parses the files and fails; the followers then wake up and must fall
+      # back to the complete old version rather than raise or see partial data.
+      backend.singleton_class.send(:define_method, :around_locale_load) do |&block|
+        load_started << :started
+        release_load.pop
+        block.call
+      end
+
+      leader_error = nil
+      leader = Thread.new do
+        begin
+          I18n.with_locale(:en) { I18n.t("alpha") }
+        rescue I18n::InvalidLocaleData => e
+          leader_error = e
+        end
+      end
+
+      load_started.pop
+
+      followers = reader_count.times.map do
+        Thread.new do
+          values = I18n.with_locale(:en) { [:alpha, :beta, :gamma].map { |key| I18n.t(key) } }
+          mutex.synchronize { seen[values] = true }
+        end
+      end
+
+      # Let followers reach the locale mutex while the leader stays parked.
+      Thread.pass until followers_blocked?(backend, :en, reader_count)
+
+      release_load << :continue
+      leader.join
+      followers.each(&:join)
+
+      assert_instance_of I18n::InvalidLocaleData, leader_error
+      assert_equal files["en_second.yml"], leader_error.filename
+      assert_equal [%w[old_a old_b old_c]], seen.keys
+      assert_equal({ alpha: "old_a", beta: "old_b", gamma: "old_c" }, translations[:en])
+    end
+  end
+
   test "eager mode: load all translations, irrespective of locale" do
     with_eager_mode do
       @backend.reload!
@@ -219,5 +349,33 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
 
     I18n.load_path.delete(locale_file.path)
   end
-end
 
+  # Creates real files (stable names are required because the lazy backend
+  # derives the locale from the filename) and yields a mapping of name -> path.
+  def with_locale_files(files)
+    require 'tmpdir'
+    Dir.mktmpdir do |dir|
+      @backend.reload!
+
+      paths = files.each_with_object({}) do |(name, contents), result|
+        path = File.join(dir, name)
+        File.write(path, contents)
+        result[name] = path
+      end
+
+      I18n.load_path = paths.values
+
+      yield(paths)
+    end
+  end
+
+  def rewrite_locale_file(path, contents)
+    File.write(path, contents)
+  end
+
+  # Whether +count+ follower threads are blocked waiting for the locale load.
+  def followers_blocked?(backend, locale, count)
+    load = backend.send(:locale_load, locale)
+    load.mutex.synchronize { load.waiters >= count }
+  end
+end
